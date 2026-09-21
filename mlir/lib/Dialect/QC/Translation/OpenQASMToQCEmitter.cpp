@@ -2334,6 +2334,16 @@ private:
     return {startWide, stepWide, stopWide};
   }
 
+  void bindArrayElement(const frontend::ForStatement& loop, Value view,
+                        Value index) {
+    const auto& source = program.arrays.at(loop.iterable->array);
+    const auto& target = program.scalars.at(loop.inductionVariable);
+    auto value = memref::LoadOp::create(builder, view, ValueRange{index});
+    setScalarValue(loop.inductionVariable,
+                   emitScalarCast(builder, builder.getLoc(), value, source.type,
+                                  target.type, target.integerWidth));
+  }
+
   void emitFor(const frontend::ForStatement& loop, ValueRange gateParameters,
                ValueRange gateQubits) {
     if (hasLoopJump(loop.body)) {
@@ -2344,21 +2354,35 @@ private:
     const auto initialValues = stateValues(slots);
     const auto scalarCheckpoint = scalarUpdates_.size();
 
-    if (loop.provenPositiveRange) {
-      auto start = emitProvenIndexExpression(builder, loop.start);
+    if (loop.iterable || loop.provenPositiveRange) {
+      Value view;
+      if (loop.iterable) {
+        view = emitArrayView(loop.iterable->array, loop.iterable->indices);
+        if (!view) {
+          return;
+        }
+      }
+      auto start = view ? arith::ConstantIndexOp::create(builder, 0).getResult()
+                        : emitProvenIndexExpression(builder, loop.start);
       if (!start) {
         return;
       }
-      auto step = emitProvenIndexExpression(builder, loop.step);
+      auto step = view ? arith::ConstantIndexOp::create(builder, 1).getResult()
+                       : emitProvenIndexExpression(builder, loop.step);
       if (!step) {
         return;
       }
-      auto stop = emitProvenIndexExpression(builder, loop.stop);
-      if (!stop) {
-        return;
+      Value exclusiveStop;
+      if (view) {
+        exclusiveStop = builder.createOrFold<memref::DimOp>(view, 0);
+      } else {
+        auto stop = emitProvenIndexExpression(builder, loop.stop);
+        if (!stop) {
+          return;
+        }
+        exclusiveStop = builder.createOrFold<arith::AddIOp>(
+            stop, arith::ConstantIndexOp::create(builder, 1));
       }
-      auto exclusiveStop = builder.createOrFold<arith::AddIOp>(
-          stop, arith::ConstantIndexOp::create(builder, 1));
       auto forOp = scf::ForOp::create(builder, start, exclusiveStop, step,
                                       initialValues);
       {
@@ -2370,10 +2394,16 @@ private:
         builder.setInsertionPointToEnd(body);
         restoreScalars(scalarCheckpoint);
         assignState(slots, forOp.getRegionIterArgs());
-        provenInductionValues[loop.inductionVariable] = forOp.getInductionVar();
-        setScalarValue(loop.inductionVariable,
-                       arith::IndexCastOp::create(builder, builder.getI64Type(),
-                                                  forOp.getInductionVar()));
+        if (view) {
+          bindArrayElement(loop, view, forOp.getInductionVar());
+        } else {
+          provenInductionValues[loop.inductionVariable] =
+              forOp.getInductionVar();
+          setScalarValue(loop.inductionVariable,
+                         arith::IndexCastOp::create(builder,
+                                                    builder.getI64Type(),
+                                                    forOp.getInductionVar()));
+        }
         for (const auto statement : loop.body) {
           emitStatement(statement, gateParameters, gateQubits);
           if (emissionFailed || emissionBudget.isExhausted()) {
@@ -2512,11 +2542,20 @@ private:
     const auto slots = mutatedState(loop.body);
     const auto scalarCheckpoint = scalarUpdates_.size();
     SmallVector<Value> initial;
-    Value step, stop;
+    Value step, stop, view;
     bool indexRange = false;
     if constexpr (std::is_same_v<Loop, frontend::ForStatement>) {
-      indexRange = loop.provenPositiveRange;
-      if (indexRange) {
+      indexRange = loop.provenPositiveRange || loop.iterable.has_value();
+      if (loop.iterable) {
+        view = emitArrayView(loop.iterable->array, loop.iterable->indices);
+        if (!view) {
+          return;
+        }
+        initial.push_back(arith::ConstantIntOp::create(builder, 0, 64));
+        step = arith::ConstantIntOp::create(builder, 1, 64);
+        stop = builder.createOrFold<arith::IndexCastOp>(
+            builder.getI64Type(), builder.createOrFold<memref::DimOp>(view, 0));
+      } else if (indexRange) {
         auto startIndex = emitProvenIndexExpression(builder, loop.start);
         auto stepIndex = emitProvenIndexExpression(builder, loop.step);
         auto stopIndex = emitProvenIndexExpression(builder, loop.stop);
@@ -2554,10 +2593,12 @@ private:
       breakPrefix.push_back(induction);
       assignState(slots, arguments.drop_front());
       if (indexRange) {
-        provenInductionValues[loop.inductionVariable] =
-            arith::IndexCastOp::create(builder, builder.getIndexType(),
-                                       induction);
-        setScalarValue(loop.inductionVariable, induction);
+        if (!view) {
+          provenInductionValues[loop.inductionVariable] =
+              arith::IndexCastOp::create(builder, builder.getIndexType(),
+                                         induction);
+          setScalarValue(loop.inductionVariable, induction);
+        }
         condition = arith::CmpIOp::create(builder, arith::CmpIPredicate::slt,
                                           induction, stop);
       } else {
@@ -2582,6 +2623,14 @@ private:
       return;
     }
     cfg.enterBody(condition, arguments);
+    if constexpr (std::is_same_v<Loop, frontend::ForStatement>) {
+      if (view) {
+        bindArrayElement(loop, view,
+                         arith::IndexCastOp::create(builder,
+                                                    builder.getIndexType(),
+                                                    arguments.front()));
+      }
+    }
     for (auto statement : loop.body) {
       emitStatement(statement, gateParameters, gateQubits);
       if (emissionFailed || emissionBudget.isExhausted()) {
